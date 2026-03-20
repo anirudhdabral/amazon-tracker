@@ -34,27 +34,33 @@ LOG_FILE    = BASE_DIR / "tracker.log"
 
 # ── Default config ────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
-    "gmail_sender":   "",          # your Gmail address
-    "gmail_password": "",          # Gmail App Password (not your normal password)
-    "notify_email":   "",          # email to receive alerts (can be same as sender)
-    "check_interval_hours": 6,     # how often to check in --watch mode
-    "request_delay_seconds": 3     # polite delay between requests
+    "gmail_sender":   "",
+    "gmail_password": "",
+    "notify_email":   "",
+    "check_interval_hours": 6,
+    "request_delay_seconds": 3
 }
 
-# ── HTTP headers (realistic browser UA) ──────────────────────────────────────
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-IN,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
+# ── Rotate User-Agents to reduce Amazon blocks ───────────────────────────────
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+def get_headers() -> dict:
+    import random
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept-Language": "en-IN,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -113,11 +119,10 @@ def log(msg: str):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Amazon scraping
+# Amazon scraping  (retries + better selectors)
 # ════════════════════════════════════════════════════════════════════════════
 
 def clean_url(url: str) -> str:
-    """Strip referral tags and shorten to bare ASIN URL."""
     match = re.search(r"(https://www\.amazon\.in/[^/]+/dp/[A-Z0-9]{10})", url)
     if match:
         return match.group(1)
@@ -127,50 +132,83 @@ def clean_url(url: str) -> str:
     return url.split("?")[0]
 
 
-def fetch_product(url: str) -> dict | None:
-    """Scrape title and current price from an Amazon.in product page."""
-    try:
-        session = requests.Session()
-        resp = session.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        log(f"  [error] Could not fetch {url}: {e}")
-        return None
+def parse_price(soup: BeautifulSoup) -> int | None:
+    """Try every known Amazon price selector and return an integer price."""
 
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    # ── Title ────────────────────────────────────────────────────────────────
-    title_tag = (
-        soup.find("span", id="productTitle") or
-        soup.find("h1", id="title")
-    )
-    title = title_tag.get_text(strip=True) if title_tag else "Unknown Product"
-
-    # ── Price — try multiple selectors Amazon uses ───────────────────────────
-    price = None
+    # Selector list — ordered from most to least reliable
     price_selectors = [
         {"class": "a-price-whole"},
         {"id": "priceblock_ourprice"},
         {"id": "priceblock_dealprice"},
         {"id": "priceblock_saleprice"},
         {"class": "a-offscreen"},
+        {"id": "corePrice_feature_div"},
     ]
+
     for sel in price_selectors:
         tag = soup.find("span", sel)
-        if tag:
-            raw = tag.get_text(strip=True).replace(",", "").replace("₹", "").replace("\u20b9", "").strip()
-            # Remove any fractional dot at the very end (e.g. "1299.")
-            raw = raw.rstrip(".")
-            # Keep only digits
-            digits = re.sub(r"[^\d]", "", raw.split(".")[0])
-            if digits:
-                price = int(digits)
-                break
+        if not tag:
+            continue
+        raw = (tag.get_text(strip=True)
+               .replace(",", "")
+               .replace("₹", "")
+               .replace("\u20b9", "")
+               .strip()
+               .rstrip("."))
+        digits = re.sub(r"[^\d]", "", raw.split(".")[0])
+        if digits:
+            return int(digits)
 
-    if price is None:
-        log(f"  [warn] Could not parse price for: {title[:60]}")
+    # Last resort: scan ALL span text for a ₹ pattern
+    for span in soup.find_all("span"):
+        text = span.get_text(strip=True)
+        m = re.search(r"[₹\u20b9]\s*([\d,]+)", text)
+        if m:
+            digits = m.group(1).replace(",", "")
+            if digits and len(digits) >= 2:
+                return int(digits)
 
-    return {"title": title, "price": price}
+    return None
+
+
+def fetch_product(url: str, retries: int = 3) -> dict | None:
+    """Scrape title and price with retries and random UA rotation."""
+
+    for attempt in range(1, retries + 1):
+        try:
+            session = requests.Session()
+            resp = session.get(url, headers=get_headers(), timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            log(f"  [error] Attempt {attempt}/{retries} — network error: {e}")
+            time.sleep(5 * attempt)
+            continue
+
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Detect if Amazon served a captcha/robot-check page
+        page_text = soup.get_text().lower()
+        if "enter the characters you see below" in page_text or "robot check" in page_text:
+            log(f"  [warn] Attempt {attempt}/{retries} — Amazon served a captcha page. Retrying…")
+            time.sleep(10 * attempt)
+            continue
+
+        # Title
+        title_tag = soup.find("span", id="productTitle") or soup.find("h1", id="title")
+        title = title_tag.get_text(strip=True) if title_tag else "Unknown Product"
+
+        price = parse_price(soup)
+
+        if price is None:
+            log(f"  [warn] Attempt {attempt}/{retries} — price not found on page (title: {title[:50]}). Retrying…")
+            time.sleep(5 * attempt)
+            continue
+
+        # Success
+        return {"title": title, "price": price}
+
+    log(f"  [error] All {retries} attempts failed for: {url}")
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -178,12 +216,12 @@ def fetch_product(url: str) -> dict | None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def send_alert(config: dict, product: dict, current_price: int):
-    sender   = config["gmail_sender"]
-    password = config["gmail_password"]
+    sender    = config["gmail_sender"]
+    password  = config["gmail_password"]
     recipient = config["notify_email"]
 
     if not all([sender, password, recipient]):
-        log("  [skip] Gmail credentials not set in config.json — skipping email.")
+        log("  [skip] Gmail credentials not set — skipping email.")
         return
 
     subject = f"🔔 Price Drop Alert: {product['title'][:60]}"
@@ -202,11 +240,8 @@ def send_alert(config: dict, product: dict, current_price: int):
           <td style="padding:8px;">₹{product['target_price']:,}</td>
         </tr>
         <tr>
-          <td style="padding:8px;background:#f5f5f5;"><b>You Save</b></td>
-          <td style="padding:8px;color:#007600;">
-            ₹{product['target_price'] - current_price:,}
-            below target
-          </td>
+          <td style="padding:8px;background:#f5f5f5;"><b>Below Target By</b></td>
+          <td style="padding:8px;color:#007600;">₹{product['target_price'] - current_price:,}</td>
         </tr>
       </table>
       <br>
@@ -231,7 +266,7 @@ def send_alert(config: dict, product: dict, current_price: int):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(sender, password)
             server.sendmail(sender, recipient, msg.as_string())
-        log(f"  [email] Alert sent to {recipient}")
+        log(f"  [email] ✅ Alert sent to {recipient}")
     except smtplib.SMTPException as e:
         log(f"  [error] Email failed: {e}")
 
@@ -246,19 +281,18 @@ def check_all(config: dict, products: list) -> list:
         return products
 
     delay = config.get("request_delay_seconds", 3)
-    log(f"Checking {len(products)} product(s)...")
+    log(f"Checking {len(products)} product(s)…")
 
     for product in products:
-        log(f"  Checking: {product['title'][:70]}")
+        log(f"  → {product['title'][:70]}")
         info = fetch_product(product["url"])
 
         if info is None:
+            log("    Skipping — could not fetch price after retries.")
             continue
 
         current_price = info["price"]
-        if current_price is None:
-            log("    Price unavailable (page may have changed).")
-            continue
+        last_alerted  = product.get("last_alerted_price")
 
         # Update history
         entry = {"date": datetime.now().isoformat(), "price": current_price}
@@ -266,14 +300,23 @@ def check_all(config: dict, products: list) -> list:
         product["last_checked"] = entry["date"]
         product["last_price"]   = current_price
 
-        log(f"    Current: ₹{current_price:,}  |  Target: ₹{product['target_price']:,}")
+        log(f"    Current: ₹{current_price:,}  |  Target: ₹{product['target_price']:,}  |  Last alerted at: {'₹' + f'{last_alerted:,}' if last_alerted else 'never'}")
 
         if current_price <= product["target_price"]:
-            log(f"    ✅ BELOW TARGET! Sending alert…")
-            send_alert(config, product, current_price)
+            # Alert only if we haven't alerted yet, OR price has dropped further
+            if last_alerted is None or current_price < last_alerted:
+                log(f"    ✅ Price at/below target — sending alert…")
+                send_alert(config, product, current_price)
+                product["last_alerted_price"] = current_price
+            else:
+                log(f"    ℹ️  Still below target but no further drop since last alert (₹{last_alerted:,}) — skipping.")
         else:
             diff = current_price - product["target_price"]
-            log(f"    ⏳ ₹{diff:,} above target.")
+            log(f"    ⏳ ₹{diff:,} above target — no alert.")
+            # Reset last_alerted if price has gone back above target
+            if last_alerted is not None:
+                log(f"    ↩️  Price recovered above target — resetting alert state.")
+                product["last_alerted_price"] = None
 
         time.sleep(delay)
 
@@ -305,7 +348,7 @@ def add_product_interactive(products: list):
     if info["price"]:
         print(f"  Price : ₹{info['price']:,}")
     else:
-        print("  Price : (could not detect — you can still set a target)")
+        print("  Price : (could not detect)")
 
     try:
         target = int(input("Target price (₹): ").strip())
@@ -315,14 +358,15 @@ def add_product_interactive(products: list):
 
     new_id = max((p.get("id", 0) for p in products), default=0) + 1
     product = {
-        "id":           new_id,
-        "url":          url,
-        "title":        info["title"],
-        "target_price": target,
-        "last_price":   info["price"],
-        "last_checked": datetime.now().isoformat(),
-        "history":      [{"date": datetime.now().isoformat(), "price": info["price"]}]
-                        if info["price"] else [],
+        "id":                  new_id,
+        "url":                 url,
+        "title":               info["title"],
+        "target_price":        target,
+        "last_price":          info["price"],
+        "last_alerted_price":  None,
+        "last_checked":        datetime.now().isoformat(),
+        "history":             [{"date": datetime.now().isoformat(), "price": info["price"]}]
+                               if info["price"] else [],
     }
     products.append(product)
     save_products(products)
@@ -354,12 +398,11 @@ def remove_product(products: list, pid: int) -> list:
 
 def watch_mode(config: dict, products: list):
     interval = config.get("check_interval_hours", 6)
-    print(f"\n🔄 Watch mode active — checking every {interval} hour(s). Ctrl+C to stop.\n")
+    print(f"\n🔄 Watch mode — checking every {interval} hour(s). Ctrl+C to stop.\n")
     while True:
-        products = load_products()   # reload in case user added products
+        products = load_products()
         check_all(config, products)
-        next_check = datetime.now().strftime("%I:%M %p")
-        log(f"Next check in {interval}h. Sleeping…")
+        log(f"Next check in {interval}h…")
         time.sleep(interval * 3600)
 
 
@@ -372,7 +415,7 @@ def main():
     parser.add_argument("--add",    action="store_true", help="Add a new product interactively")
     parser.add_argument("--list",   action="store_true", help="List all tracked products")
     parser.add_argument("--remove", type=int, metavar="ID", help="Remove a product by ID")
-    parser.add_argument("--watch",  action="store_true", help="Run continuously, checking on interval")
+    parser.add_argument("--watch",  action="store_true", help="Run continuously on interval")
     args = parser.parse_args()
 
     config   = load_config()
@@ -387,7 +430,6 @@ def main():
     elif args.watch:
         watch_mode(config, products)
     else:
-        # Default: check all products once
         check_all(config, products)
 
 
