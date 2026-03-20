@@ -5,7 +5,7 @@
     "title": "Crucial RAM 8GB DDR4 3200MHz CL22 (or 2933MHz or 2666MHz) Laptop Memory CT8G4SFRA32A",
     "target_price": 9000,
     "last_price": 6299,
-    "last_checked": "2026-03-20T11:52:17.394963",
+    "last_checked": "2026-03-20T11:54:25.693725",
     "history": [
       {
         "date": "2026-03-20T17:16:18.405288",
@@ -13,6 +13,10 @@
       },
       {
         "date": "2026-03-20T11:52:17.394963",
+        "price": 6299
+      },
+      {
+        "date": "2026-03-20T11:54:25.693725",
         "price": 6299
       }
     ]
